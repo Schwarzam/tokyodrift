@@ -35,6 +35,7 @@ def open_log(path) -> pd.DataFrame:
 
     # 3) Tentar converter colunas numéricas automaticamente
     for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="ignore")
-        
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     return df
