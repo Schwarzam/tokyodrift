@@ -87,7 +87,7 @@ def add_fuel_estimates(
       - fuel_flow_total_cc_s: vazão total (todos injetores) [cc/s]
       - fuel_flow_total_g_s: massa total [g/s]
       - fuel_mg_per_cyl: massa por cilindro por ciclo [mg/ciclo/cil]
-      - fuel_mg_per_inj: massa por evento de injeção por cilindro [mg/injeção] (≈ igual ao anterior em sequencial 1x/720°)
+      - fuel_mg_per_inj: massa por evento de injeção por cilindro [mg/injeção] (≈ mg/ciclo em sequencial 1x/720°)
     """
     d = df.copy()
 
@@ -655,6 +655,110 @@ def plot_lambda_error_heatmap(df: pd.DataFrame, rpm_bins=None, map_bins=None, ti
     return fig, ax
 
 
+def plot_rpm_map_fuel_scatter(
+    df: pd.DataFrame,
+    rpm_col: str = "RPM",
+    map_col: str = "MAP",
+    fuel_col: str | None = None,
+    cmap: str = "viridis",
+    size: float = 10.0,
+    alpha: float = 0.8,
+    clip_pct: tuple[float, float] | None = (1.0, 99.0),
+    log_color: bool = False,
+    title: str = "RPM vs MAP colorido por injeção"
+):
+    """
+    Scatter: X=RPM, Y=MAP, cores pelo nível de injeção.
+    Escolha automática de fuel_col se não informado:
+      tenta em ordem: fuel_flow_total_g_s, fuel_flow_total_cc_s, fuel_mg_per_inj, fuel_mg_per_cyl, PW, Duty Cycle.
+    Dicas:
+      - Chame df.ecu.add_fuel_estimates(...) antes para obter colunas como 'fuel_flow_total_g_s'.
+      - Use clip_pct para cortar outliers do mapa de cores (percentis).
+      - Use log_color=True para escala de cor logarítmica (requer valores > 0).
+    """
+    # Validar colunas básicas
+    if rpm_col not in df.columns or map_col not in df.columns:
+        missing = [c for c in [rpm_col, map_col] if c not in df.columns]
+        raise ValueError(f"Colunas ausentes: {missing}. Certifique-se que o log possui RPM e MAP.")
+
+    # Inferir coluna de combustível, se não informada
+    if fuel_col is None:
+        candidates = [
+            "fuel_flow_total_g_s",
+            "fuel_flow_total_cc_s",
+            "fuel_mg_per_inj",
+            "fuel_mg_per_cyl",
+            "PW",
+            "Duty Cycle",
+            "fuel",           # caso o usuário já tenha criado
+            "inj_ms"          # variação comum
+        ]
+        fuel_col = next((c for c in candidates if c in df.columns), None)
+        if fuel_col is None:
+            raise ValueError("Não encontrei coluna de injeção. Informe fuel_col ou chame add_fuel_estimates().")
+
+    # Preparar dados
+    d = df[[rpm_col, map_col, fuel_col]].dropna().copy()
+    if len(d) == 0:
+        raise ValueError("Sem dados válidos após remover NaNs em RPM/MAP/fuel.")
+
+    # Determinar limites de cor
+    vmin = vmax = None
+    if clip_pct is not None:
+        p_lo, p_hi = clip_pct
+        p_lo = max(0.0, min(100.0, float(p_lo)))
+        p_hi = max(0.0, min(100.0, float(p_hi)))
+        if p_hi <= p_lo:
+            p_lo, p_hi = 1.0, 99.0
+        vmin, vmax = np.percentile(d[fuel_col], [p_lo, p_hi])
+
+    norm = None
+    if log_color:
+        from matplotlib.colors import LogNorm
+        # garantir positivos
+        positive = d[fuel_col] > 0
+        d = d[positive]
+        if len(d) == 0:
+            raise ValueError("Todos os valores de cor são <= 0; não é possível usar escala log.")
+        if vmin is None or vmin <= 0:
+            vmin = d[fuel_col].quantile(0.01)
+        if vmax is None:
+            vmax = d[fuel_col].quantile(0.99)
+        vmin = max(vmin, np.nextafter(0, 1))  # evitar zero exato
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+
+    # Rótulo de cor padrão
+    def _color_label(col):
+        cname = col
+        if col == "Duty Cycle": return "Duty (%)"
+        if col == "PW": return "PW (ms)"
+        if "g_s" in col: return "Fluxo de combustível (g/s)"
+        if "cc_s" in col: return "Fluxo de combustível (cc/s)"
+        if "mg_per_inj" in col: return "Combustível por injeção (mg)"
+        if "mg_per_cyl" in col: return "Combustível por ciclo/cil (mg)"
+        return cname
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    sc_kwargs = dict(c=d[fuel_col], cmap="plasma", s=size, alpha=alpha, edgecolors="none")
+    if norm is not None:
+        sc_kwargs["norm"] = norm
+    else:
+        if vmin is not None and vmax is not None:
+            sc_kwargs["vmin"] = vmin
+            sc_kwargs["vmax"] = vmax
+
+    sc = ax.scatter(d[rpm_col], d[map_col], **sc_kwargs)
+    ax.set_xlabel("RPM")
+    ax.set_ylabel("MAP (kPa)")
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label(_color_label(fuel_col))
+    plt.tight_layout()
+    plt.show()
+    return fig, ax
+
+
 # ============== Classe de alto nível e accessor do DataFrame ==============
 
 class EngineLog:
@@ -701,6 +805,9 @@ class EngineLog:
     def plot_lambda_heatmap(self, **kwargs):
         return plot_lambda_error_heatmap(self.df, **kwargs)
 
+    def plot_rpm_map_fuel_scatter(self, **kwargs):
+        return plot_rpm_map_fuel_scatter(self.df, **kwargs)
+
 
 # Pandas accessor para chamar como df.ecu.<método>
 @pd.api.extensions.register_dataframe_accessor("ecu")
@@ -742,12 +849,18 @@ class ECUAccessor:
     def plot_lambda_heatmap(self, **kwargs):
         return plot_lambda_error_heatmap(self._obj, **kwargs)
 
+    def plot_rpm_map_fuel_scatter(self, **kwargs):
+        return plot_rpm_map_fuel_scatter(self._obj, **kwargs)
+
 
 # ===================== Uso esperado (no notebook) =====================
 # from seu_modulo import EngineLog
 # log = EngineLog("caminho_para_arquivo_log.msl", name="MeuLog")
 # df = log.df
 # df.ecu.add_fuel_estimates(inj_flow_cc_min=200, num_inj=4, n_cyl=4, fuel_density_g_cc=0.789, inj_rated_dp_kpa=300, reg_ref="manifold")
+# df.ecu.plot_rpm_map_fuel_scatter()  # usa colunas inferidas para colorir
+# # Ou escolhendo explicitamente a coluna de cor:
+# df.ecu.plot_rpm_map_fuel_scatter(fuel_col="fuel_flow_total_g_s", clip_pct=(2,98), log_color=False)
 # df.ecu.plot_auto(df_name=log.name)
 # df.ecu.plot_partida()
 # segs = df.ecu.segments()
